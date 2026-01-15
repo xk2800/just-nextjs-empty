@@ -1,42 +1,67 @@
-name: Build & Deploy Next.js (Pi Zero 2 W)
+name: Deploy to Pi
 
 on:
   push:
-    branches: [master]
+    branches: ["master"]
 
 jobs:
-  deploy:
+  # JOB 1: Build on GitHub's fast servers
+  build:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - uses: oven-sh/setup-bun@v1 # or actions/setup-node
         with:
-          node-version: 24
+          bun-version: latest
 
-      - name: Install dependencies
-        run: npm ci
+      - name: Install Dependencies
+        run: bun install --frozen-lockfile
 
-      - name: Build
-        run: npm run build
+      - name: Build Standalone
+        run: bun run build
+        env:
+          NEXT_TELEMETRY_DISABLED: 1
 
-      - name: Deploy to Pi
-        uses: appleboy/scp-action@v0.1.7
+      # Pack the standalone build
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
         with:
-          host: ${{ secrets.PI_HOST }}
-          username: ${{ secrets.PI_USER }}
-          key: ${{ secrets.PI_SSH_KEY }}
-          source: "out/*"
-          target: "/home/pi/apps/site-test"
+          name: nextjs-build
+          path: |
+            .next/standalone
+            .next/static
+            public
 
-      - name: Restart PM2
-        uses: appleboy/ssh-action@v1.0.3
+  # JOB 2: Deploy on your Pi Zero 2 (Self-Hosted Runner)
+  deploy:
+    needs: build
+    runs-on: self-hosted
+    steps:
+      - name: Stop App
+        run: pm2 stop next-app || true
+
+      - name: Clean Old Files
+        run: rm -rf /home/admin/test-app/*
+
+      - name: Download Artifact
+        uses: actions/download-artifact@v4
         with:
-          host: ${{ secrets.PI_HOST }}
-          username: ${{ secrets.PI_USER }}
-          key: ${{ secrets.PI_SSH_KEY }}
-          script: |
-            cd /home/admin/apps/site-test
-            pm2 restart site-test || pm2 start serve --name site-test -- -s out -l 3000
+          name: nextjs-build
+          path: /home/admin/test-app
+
+      # Move static files to correct location for standalone
+      - name: Organize Files
+        run: |
+          mkdir -p /home/admin/test-app/.next/static
+          mv /home/admin/test-app/.next/static /home/admin/test-app/.next/standalone/.next/
+          cp -r /home/admin/test-app/public /home/admin/test-app/.next/standalone/
+
+      - name: Install Production Deps (minimal)
+        working-directory: /home/admin/test-app/.next/standalone
+        run: bun install --production # Usually not needed for standalone, but good safety
+
+      - name: Start App
+        working-directory: /home/admin/test-app/.next/standalone
+        run: |
+          pm2 restart next-app || pm2 start server.js --name next-app --interpreter bun
+          pm2 save
